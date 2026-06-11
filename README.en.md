@@ -9,6 +9,10 @@ CPAPriorityKeeper is a background tool that **automatically tunes the priority a
 
 The two are complementary — they write different credential types and never fight over the same one.
 
+> **Default is "passive mode"**: it re-ranks priority purely from the Usage Keeper's historical success/failure rates, sending **zero extra probe requests — no quota burned**. More failures → lower priority; successes → higher priority, fully automatic. A dead relay only sinks to priority `1` (kept as fallback) and is **not disabled by default** — because once disabled it gets no traffic, so the DB can never see it recover (a one-way trap). Left at `1` it still catches occasional fallback traffic, so when its budget returns the DB sees the successes and lifts it back automatically.
+>
+> For more aggressive real-time liveness checks, enable `CPA_ENABLE_LIVE_PROBE=true` in `.env` (sends a real request to every routable provider, burning quota) and `CPA_DISABLE_DEAD=true` (additionally sets `disabled` on confirmed-dead openai-compat entries).
+
 > This project targets **authorized local / internal maintenance**: your own CPA instance, your own relay account pool. Do not use it against targets you are not authorized to manage.
 
 ## What problem it solves
@@ -21,14 +25,15 @@ But relay availability is **dynamic**:
 - Token revoked / account banned → permanently dead.
 - Upstream Cloudflare / routing jitter → occasional failures, but the credential itself is fine.
 
-CPAPriorityKeeper's goal is to **tell these cases apart**: rank the genuinely-working ones first, let the temporarily-out-of-budget ones "rest", sink or disable the permanently-dead ones, and automatically bring them back to the front of the queue once they recover.
+CPAPriorityKeeper's goal is to **tell these cases apart**: rank the genuinely-working ones first, sink the dead ones to priority `1`, and automatically bring them back to the front of the queue once the DB sees them recover.
 
 ## What each round does
 
 1. Read **recent N-day real success/failure rates per credential** from the [CPA Usage Keeper](https://github.com/Willxup/cpa-usage-keeper) SQLite DB (read-only, joined to config entries by `auth_index` / `lookup_key`).
-2. For each **prefix-routable** provider, send a **real request** (default prompt: "write a python script to unzip a file, core code only") to see whether it actually works right now.
-3. Combine "live probe result" + "historical health" + "cross-round state" into a target priority tier.
-4. Only when priority (or openai-compatibility's `disabled`) actually changes, write it back atomically via the CPA management API using a **full-list PUT**.
+2. Combine "historical health" + "cross-round state" into a target priority tier (lower fail% → higher tier).
+3. Only when priority (or openai-compatibility's `disabled`) actually changes, write it back atomically via the CPA management API using a **full-list PUT**.
+
+> **Optional probe (off by default)**: with `CPA_ENABLE_LIVE_PROBE=true`, each round additionally sends a **real request** (default prompt: "write a python script to unzip a file, core code only") to every **prefix-routable** provider and folds the live result into scoring. This burns quota — enable it only when you want active liveness checks.
 
 ## Priority direction (confirmed against source)
 
@@ -42,9 +47,9 @@ Verified empirically: the CPA management API's `PATCH /v0/management/<type>` han
 
 So this project does: `GET` the full list → score each entry → mutate only `priority`/`disabled` on a **verbatim copy** → `PUT` the full list. All other fields and ordering are preserved.
 
-## Four-state probe classification
+## Four-state probe classification (only with probing on)
 
-`prober.classify()` maps a probe to four semantics — the key to "temporary vs permanent failure":
+> Passive mode has no probe — skip this section. Only when `CPA_ENABLE_LIVE_PROBE=true`, `prober.classify()` maps a probe to four semantics — the key to "temporary vs permanent failure":
 
 | Bucket | Meaning | Triggers | Handling |
 |--------|---------|----------|----------|
@@ -55,7 +60,9 @@ So this project does: `GET` the full list → score each entry → mutate only `
 
 ## Scoring rules (the important ones)
 
-Core constraints learned from real data:
+**Passive mode (default)**: ranks purely by recent-window DB fail% — lower fail% = higher tier; only after `dead_streak` (default 2) consecutive `≈100%` rounds does it sink to `dead` (priority `1`, but **not disabled**). More failures → lower tier, successes → higher tier, fully automatic.
+
+**Probe mode (optional)** layers these extra constraints (learned from real data):
 
 - **A single probe failure is only a weak signal** — never kill a credential the DB shows healthy (real example: `codex-muyuan` returns 403/Cloudflare on probe but only 20% fail in the DB over 7 days → trust the DB, keep it).
 - **A single probe OK doesn't crown it either**: when the DB shows lots of failures, rank by DB fail% and use OK only as a "not below flaky" floor.
@@ -88,11 +95,12 @@ The scorer **owns** all streak transitions and returns them in a `Decision`, gua
 
 ## Safety design
 
+- **Passive by default**: ranks purely from usage history, sends zero extra requests, and **never disables** — a dead relay only sinks to priority `1` (still eligible for fallback), so the DB can observe it recovering. Disabling (`CPA_DISABLE_DEAD=true`) is opt-in.
 - **Does not touch OAuth auth-files** (left to CPACodexKeeper), avoiding dual-writer conflicts.
 - Writes back a **verbatim-copied full list**, mutating only `priority`/`disabled`, losing no field; strips server-injected read-only fields (`auth-index`).
 - PUTs only when a value actually changed.
-- A probe failure never kills on its own — the DB must also confirm, for `dead_streak` consecutive rounds.
-- Never auto-**re-enables** an entry you manually disabled — unless there is positive evidence (probe OK or DB clearly succeeding).
+- Death needs confirmation — `dead_streak` consecutive `≈100%`-fail rounds (and, in probe mode, a probe failure never kills on its own; the DB must also confirm).
+- Never auto-**re-enables** an entry you manually disabled — unless there is positive evidence (DB clearly succeeding, or a probe OK).
 - Never touches anything at/above the pin floor.
 - `--dry-run` lets you preview every change before applying.
 
@@ -104,11 +112,11 @@ Copy the template and fill it in:
 cp .env.example .env
 ```
 
-Only 3 are required:
+Only 2 are required (passive mode):
 
 - `CPA_ENDPOINT`: CPA management API address (e.g. `http://127.0.0.1:8317`)
 - `CPA_TOKEN`: CPA management key
-- `CPA_CLIENT_API_KEY`: any client key under `api-keys:` in `config.yaml` (used for probing)
+- `CPA_CLIENT_API_KEY`: any client key under `api-keys:` in `config.yaml` — **only needed if you enable probing** (`CPA_ENABLE_LIVE_PROBE=true`)
 
 The rest have sensible defaults — see the comments in `.env.example`. Leaving `CPA_USAGE_DB` empty auto-locates the sibling `cpa-usage-keeper_*/data/app.db`.
 
@@ -127,7 +135,7 @@ python main.py --once
 python main.py
 ```
 
-> **For the first cleanup, run `--once` twice**: because death requires `dead_streak` (default 2) consecutive confirmations, the first round demotes dead relays to `poor` and only the second actually sets them `dead`/`disabled`. This is intentional anti-flap.
+> **For the first cleanup, run `--once` twice**: because death requires `dead_streak` (default 2) consecutive confirmations, the first round demotes dead relays to `poor` and only the second actually sinks them to `dead` (priority `1`). This is intentional anti-flap.
 
 ## Auto-start
 

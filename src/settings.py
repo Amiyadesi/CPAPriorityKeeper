@@ -14,30 +14,31 @@ DEFAULT_PROBE_MAX_TOKENS = 64
 # Health windows (days) used when reading the usage keeper DB.
 DEFAULT_RECENT_WINDOW_DAYS = 7
 # A credential needs at least this many recent requests before its DB fail%
-# is trusted on its own; below this we lean on the live probe.
+# is trusted on its own; below this we treat it as thin/unknown history.
 DEFAULT_MIN_SAMPLE = 8
 
 # ---- Priority ladder (HIGHER = served first under fill-first) --------------
 # Confirmed against CLIProxyAPI sdk/cliproxy/auth/selector.go:getAvailableAuths
 # -> it selects the MAX priority tier; default/missing priority == 0 == lowest.
-DEFAULT_PRIO_HEALTHY = 600      # probe OK and fail% < healthy_threshold
-DEFAULT_PRIO_GOOD = 500         # probe OK and fail% < good_threshold
-DEFAULT_PRIO_USABLE = 400       # probe OK and fail% < usable_threshold
+# In passive (default) mode every tier is chosen from the usage-DB fail% alone.
+DEFAULT_PRIO_HEALTHY = 600      # fail% < healthy_threshold
+DEFAULT_PRIO_GOOD = 500         # fail% < good_threshold
+DEFAULT_PRIO_USABLE = 400       # fail% < usable_threshold
 DEFAULT_PRIO_FLAKY = 300        # fail% in [usable, flaky_threshold)
-DEFAULT_PRIO_POOR = 200         # probe hard-fail now but historically worked
-DEFAULT_PRIO_RESTING = 150      # quota/rate-limit exhausted now; recovers later
-DEFAULT_PRIO_DEAD = 1           # permanently broken (revoked); last resort
+DEFAULT_PRIO_POOR = 200         # (probe mode) hard-fail now but historically OK
+DEFAULT_PRIO_RESTING = 150      # (probe mode) quota/rate-limit exhausted now
+DEFAULT_PRIO_DEAD = 1           # fail% >= dead_threshold; last-resort fallback
 
 # ---- Recovery / anti-flap --------------------------------------------------
-# Consecutive permanent-failure signals required before a credential is demoted
-# to "dead" (and openai-compat disabled). Damps single-round false negatives.
+# Consecutive dead-level signals required before a credential is demoted to
+# "dead" (priority 1, and disabled only if enable_disable_dead). Damps a single
+# bad round from sinking a provider that was just briefly out of budget.
 DEFAULT_DEAD_STREAK = 2
-# Consecutive OK probes required before a previously-bad credential is fully
-# promoted back to its health tier (otherwise it climbs one step at a time).
+# Consecutive healthy rounds required before a previously-bad credential is
+# fully promoted back to its health tier (otherwise it climbs one step a round).
 DEFAULT_PROMOTE_STREAK = 1
-# A credential marked dead is still re-probed every round so it can recover when
-# quota/credit returns. This flag lets a dead entry climb straight back on the
-# first OK rather than waiting out the promote streak.
+# Let a dead entry climb straight back on the first healthy round rather than
+# waiting out the promote streak -- so returning budget is picked up fast.
 DEFAULT_FAST_RECOVERY = True
 
 # Fail% thresholds (percent).
@@ -76,9 +77,14 @@ class Settings:
     min_sample: int = DEFAULT_MIN_SAMPLE
     probe_prompt: str = "写一个解压zip文件的python脚本，只要核心代码"
 
-    enable_live_probe: bool = True
-    # When true, also set the openai-compatibility "disabled" flag for dead providers.
-    enable_disable_dead: bool = True
+    # Default OFF: passive mode scores purely from usage-keeper history (the
+    # traffic you already send), so it costs ZERO extra quota. Set true to also
+    # send a real probe request to each prefix-routable provider each round.
+    enable_live_probe: bool = False
+    # Default OFF in passive mode: never auto-disable. A disabled provider gets
+    # no traffic, so the DB can never observe it recovering -> one-way trap.
+    # Sinking to priority 1 keeps it eligible for fallback so recovery is seen.
+    enable_disable_dead: bool = False
     # Manage these credential types.
     manage_codex_key: bool = True
     manage_openai_compat: bool = True
@@ -179,7 +185,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
     if not endpoint.startswith(("http://", "https://")):
         raise SettingsError("CPA_ENDPOINT must start with http:// or https://")
 
-    enable_probe = _read_bool("CPA_ENABLE_LIVE_PROBE", True, env_values)
+    enable_probe = _read_bool("CPA_ENABLE_LIVE_PROBE", False, env_values)
     if enable_probe and not client_key:
         raise SettingsError(
             "CPA_CLIENT_API_KEY is required when CPA_ENABLE_LIVE_PROBE is true "
@@ -213,7 +219,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         min_sample=_read_int("CPA_MIN_SAMPLE", DEFAULT_MIN_SAMPLE, env_values, minimum=1),
         probe_prompt=(_get("CPA_PROBE_PROMPT", env_values) or "写一个解压zip文件的python脚本，只要核心代码").strip(),
         enable_live_probe=enable_probe,
-        enable_disable_dead=_read_bool("CPA_DISABLE_DEAD", True, env_values),
+        enable_disable_dead=_read_bool("CPA_DISABLE_DEAD", False, env_values),
         manage_codex_key=_read_bool("CPA_MANAGE_CODEX_KEY", True, env_values),
         manage_openai_compat=_read_bool("CPA_MANAGE_OPENAI_COMPAT", True, env_values),
         manage_gemini_key=_read_bool("CPA_MANAGE_GEMINI_KEY", True, env_values),
