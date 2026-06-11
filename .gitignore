@@ -1,0 +1,25 @@
+# --- Secrets / local config (NEVER commit) ---
+.env
+
+# --- Runtime state & logs ---
+state.json
+state.json.bak*
+.state-*
+logs/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
